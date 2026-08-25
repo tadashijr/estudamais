@@ -25,16 +25,29 @@ A caixa **"Mostrar apenas modelos gratuitos"** vem marcada. O filtro considera g
 
 Desmarque para ver o catálogo inteiro. Modelos gratuitos costumam ter limites de requisições por minuto mais apertados; se um quiz falhar por rate limit, troque de modelo ou aguarde.
 
-## Fotos do material
+## Anexar arquivos
 
-Além de colar texto, dá para anexar imagens — foto de página de livro, quadro, caderno, slide. Clique na área tracejada, arraste os arquivos ou cole com Ctrl+V.
+Além de colar texto, dá para anexar arquivos: clique na área tracejada, arraste ou cole com Ctrl+V. Depois clique em **Extrair texto dos arquivos** — o texto de todos eles é acrescentado à caixa de estudo, com o nome do arquivo como cabeçalho.
 
-Ao clicar em **Extrair texto das imagens**, cada foto é enviada a um modelo com visão, que transcreve o conteúdo; o texto é acrescentado à caixa de estudo para você revisar antes de gerar o resumo e o quiz.
+| Formato | Como é lido | Onde acontece |
+|---|---|---|
+| `.pdf` com texto | pdf.js, página por página | no navegador |
+| `.pdf` escaneado | páginas viram imagem e vão para OCR | modelo de visão |
+| `.docx` | mammoth.js | no navegador |
+| `.pptx` | JSZip lê `ppt/slides/slideN.xml`, separado por slide | no navegador |
+| `.xlsx` `.xls` `.csv` | SheetJS, cada aba como CSV | no navegador |
+| `.txt` `.md` | leitura direta | no navegador |
+| imagens | transcrição por modelo de visão | modelo de visão |
 
-- Modelos com visão aparecem no seletor com 🖼
-- Se o modelo escolhido não lê imagens, a aplicação usa automaticamente um modelo com visão da lista (respeitando o filtro de gratuitos) só para essa etapa; o resumo e o quiz continuam no modelo que você selecionou
-- As imagens são reduzidas para no máximo 1600px antes do envio, para economizar tokens
-- Limite de 8 imagens por vez
+Só imagens e PDFs escaneados consomem crédito da API — os demais são processados inteiramente no seu navegador, sem enviar o arquivo a lugar nenhum. As bibliotecas são carregadas do CDN cdnjs sob demanda, apenas quando um formato que precisa delas é anexado.
+
+**PDF escaneado:** quando uma página tem quase nenhum texto extraível, ela é rasterizada e mandada para OCR automaticamente. Isso significa uma chamada de API por página — cuidado com PDFs longos em modelos gratuitos, que têm limite de requisições por minuto.
+
+**Modelos de visão:** aparecem no seletor com 🖼. Se o modelo escolhido não lê imagens, a aplicação toma emprestado um modelo com visão da lista (respeitando o filtro de gratuitos) só para a transcrição; resumo e quiz continuam no modelo selecionado.
+
+**Formatos antigos** (`.doc`, `.ppt`, binários pré-2007) não são suportados — salve como `.docx` / `.pptx`.
+
+Limite de 12 arquivos por vez. Cada linha da lista mostra o resultado individual: quantidade de caracteres extraídos ou o motivo da falha.
 
 Transcrição automática erra em letra cursiva, foto torta ou com pouca luz. Sempre revise o texto extraído antes de gerar o quiz — um erro na transcrição vira uma pergunta errada.
 
