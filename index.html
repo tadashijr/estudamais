@@ -147,6 +147,11 @@
   .error-box{font-size:12.5px; color:#B91C1C; background:#FEE2E2; border-radius:12px; padding:10px 12px; margin-top:10px; line-height:1.45; white-space:pre-wrap;}
   .hint{font-size:11px; color:#9C94B8; text-align:center; margin-top:8px;}
   /* ---------- Filtro / anexos ---------- */
+  .btnrow{display:flex; gap:10px; align-items:stretch; margin-top:18px;}
+  .btnrow .btn{margin:0;}
+  .btnrow .btn.purple{flex:1; max-width:none;}
+  .btnrow .btn.clear{flex:0 0 auto; width:auto; padding:13px 18px; background:#fff; color:var(--muted); border:2px solid var(--line); box-shadow:none; font-size:15px;}
+  .btnrow .btn.clear:hover:not(:disabled){border-color:var(--red); color:var(--red);}
   .checkline{display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px; font-weight:600; cursor:pointer;}
   .checkline input{width:17px; height:17px; accent-color:var(--purple); cursor:pointer;}
   .tag-free{display:inline-block; font-size:9.5px; font-weight:700; padding:2px 7px; border-radius:999px; background:#DCFCE7; color:#15803D; margin-left:6px;}
@@ -231,7 +236,10 @@
         </select>
       </div>
     </div>
-    <button class="btn purple" id="start-btn" type="button">🚀 Gerar resumo e quiz</button>
+    <div class="btnrow">
+      <button class="btn purple" id="start-btn" type="button">🚀 Gerar resumo e quiz</button>
+      <button class="btn clear" id="clear-btn" type="button" title="Limpar conteúdo, anexos e quiz">🧹 Limpar</button>
+    </div>
     <div class="error-box hidden" id="input-error"></div>
   </div>
 
@@ -567,6 +575,7 @@ function renderFiles(){
   });
   $('ocr-btn').classList.toggle('hidden', !S.files.length);
   if (!S.files.length) $('ocr-status').textContent = "";
+  if (typeof updateClearBtn === "function") updateClearBtn();
 }
 
 $('dropzone').addEventListener('click', () => $('file-input').click());
@@ -638,6 +647,7 @@ $('ocr-btn').addEventListener('click', async () => {
   ta.scrollTop = ta.scrollHeight;
   $('ocr-status').style.color = "#15803D";
   $('ocr-status').textContent = `${parts.length} arquivo(s) processado(s). Revise o texto acima antes de gerar o quiz.`;
+  updateClearBtn();
 });
 
 function parseJson(raw){
@@ -704,6 +714,7 @@ $('start-btn').addEventListener('click', async () => {
     S.summary = await chat(SYS_SUMMARY(S.level), S.text, { temperature:0.3 });
     $('summary-body').innerHTML = renderSummary(S.summary);
     $('go-quiz-btn').classList.remove('hidden');
+    updateClearBtn();
   } catch(e){
     $('summary-body').innerHTML = `<div class="error-box">Erro ao gerar o resumo: ${esc(e.message)}</div>`;
     $('start-btn').disabled = false;
@@ -862,14 +873,40 @@ async function correctRound(ri){
   await generateRound({ first:false, missed });
 }
 
-$('restart-btn').addEventListener('click', () => {
-  S.rounds = []; S.summary = "";
+/* ===================== LIMPAR / RECOMEÇAR ===================== */
+function hasWork(){
+  return !!($('study-text').value.trim() || S.files.length || S.summary || S.rounds.length);
+}
+function updateClearBtn(){
+  const b = $('clear-btn');
+  b.disabled = !hasWork();
+  b.style.opacity = b.disabled ? .45 : 1;
+}
+function resetAll(){
+  S.rounds = []; S.summary = ""; S.text = ""; S.files = [];
   $('rounds').innerHTML = ""; $('summary-body').innerHTML = "";
   $('quiz-stage').classList.add('hidden'); $('summary-stage').classList.add('hidden');
-  $('restart-btn').classList.add('hidden'); $('start-btn').disabled = false;
-  $('study-text').value = ""; S.files = []; renderFiles(); $('ocr-status').textContent = ""; $('study-text').focus();
+  $('go-quiz-btn').classList.add('hidden'); $('restart-btn').classList.add('hidden');
+  hideErr('quiz-error'); hideErr('input-error');
+  $('quiz-loader').classList.add('hidden'); $('summary-loader').classList.add('hidden');
+  $('start-btn').disabled = false;
+  $('study-text').value = "";
+  renderFiles();
+  $('ocr-status').textContent = "";
+  $('progress-fill').style.width = "0%"; $('progress-text').textContent = "0 de 0"; $('score-text').textContent = "0 / 0 ✔️";
+  updateClearBtn();
   window.scrollTo({ top:0, behavior:'smooth' });
+  $('study-text').focus();
+}
+
+$('clear-btn').addEventListener('click', () => {
+  const risky = S.rounds.length || S.summary;
+  if (risky && !confirm("Limpar tudo e começar um novo estudo? O resumo e o quiz atuais serão descartados.")) return;
+  resetAll();
 });
+$('restart-btn').addEventListener('click', resetAll);
+$('study-text').addEventListener('input', updateClearBtn);
+updateClearBtn();
 </script>
 </body>
 </html>
