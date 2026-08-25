@@ -6,6 +6,7 @@
 <title>EstudaMais — Resumo e Quiz com IA</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- extratores de texto (carregados sob demanda pelo script no fim da página) -->
 <style>
 
 
@@ -152,10 +153,15 @@
   .dropzone{border:2px dashed var(--line); border-radius:14px; padding:16px; text-align:center; font-size:13px; color:var(--muted); cursor:pointer; transition:all .15s; margin-top:6px;}
   .dropzone:hover, .dropzone.over{border-color:var(--purple); background:#FAFAFF; color:var(--purple);}
   .dropzone b{display:block; font-family:'Baloo 2',sans-serif; font-size:15px; color:var(--purple); margin-bottom:2px;}
-  .thumbs{display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;}
-  .thumb{position:relative; width:74px; height:74px; border-radius:10px; overflow:hidden; border:2px solid var(--line);}
-  .thumb img{width:100%; height:100%; object-fit:cover; display:block;}
-  .thumb button{position:absolute; top:2px; right:2px; width:20px; height:20px; border:none; border-radius:50%; background:rgba(0,0,0,.6); color:#fff; font-size:12px; line-height:1; cursor:pointer; padding:0;}
+  .filelist{list-style:none; padding:0; margin:10px 0 0; display:flex; flex-direction:column; gap:6px;}
+  .filerow{display:flex; align-items:center; gap:10px; background:var(--soft); border-radius:10px; padding:8px 10px; font-size:12.5px;}
+  .filerow .ficon{font-size:18px; flex-shrink:0;}
+  .filerow .fmeta{flex:1; min-width:0;}
+  .filerow .fname{display:block; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .filerow .fstat{display:block; font-size:11px; color:var(--muted);}
+  .filerow .fstat.ok{color:#15803D;} .filerow .fstat.err{color:#B91C1C;} .filerow .fstat.busy{color:var(--purple);}
+  .filerow .fthumb{width:34px; height:34px; border-radius:8px; object-fit:cover; flex-shrink:0;}
+  .filerow button{background:#fff; border:2px solid var(--line); border-radius:8px; width:26px; height:26px; cursor:pointer; color:#B91C1C; font-size:13px; line-height:1; padding:0; flex-shrink:0;}
   @media (prefers-reduced-motion: reduce){ .spinner{animation:none;} #progress-fill{transition:none;} }
 
 
@@ -200,15 +206,15 @@
     <label class="field" for="study-text">Cole ou digite o conteúdo</label>
     <textarea id="study-text" placeholder="Cole aqui o texto do livro, da apostila, anotações da aula... ou anexe fotos abaixo."></textarea>
 
-    <label class="field">Ou envie fotos do material</label>
+    <label class="field">Ou envie arquivos com o conteúdo</label>
     <div class="dropzone" id="dropzone">
-      <b>📷 Anexar imagens</b>
-      foto da página, quadro, caderno — clique, arraste ou cole (Ctrl+V)
+      <b>📎 Anexar arquivos</b>
+      PDF · Word · PowerPoint · Excel · imagens · txt — clique, arraste ou cole (Ctrl+V)
     </div>
-    <input type="file" id="file-input" accept="image/*" multiple hidden>
-    <div class="thumbs" id="thumbs"></div>
-    <button class="btn sm ghost hidden" id="ocr-btn" type="button" style="margin-top:10px;">🔍 Extrair texto das imagens</button>
-    <div class="loader hidden" id="ocr-loader"><div class="spinner"></div><span id="ocr-loader-text">Lendo as imagens...</span></div>
+    <input type="file" id="file-input" accept=".pdf,.docx,.doc,.pptx,.xlsx,.xls,.csv,.txt,.md,image/*" multiple hidden>
+    <ul class="filelist" id="filelist"></ul>
+    <button class="btn sm ghost hidden" id="ocr-btn" type="button" style="margin-top:10px;">📄 Extrair texto dos arquivos</button>
+    <div class="loader hidden" id="ocr-loader"><div class="spinner"></div><span id="ocr-loader-text">Processando...</span></div>
     <div class="help" id="ocr-status"></div>
     <div class="row">
       <div>
@@ -271,7 +277,7 @@ const CONFIG = {
   ]
 };
 
-const S = { apiKey:"", model:CONFIG.DEFAULT_MODEL, models:[], onlyFree:true, images:[], text:"", level:"", summary:"", rounds:[] };
+const S = { apiKey:"", model:CONFIG.DEFAULT_MODEL, models:[], onlyFree:true, files:[], text:"", level:"", summary:"", rounds:[] };
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const COLORS = ["#22C55E","#0EA5E9","#8B5CF6","#EC4899","#F97316","#14B8A6","#F43F5E","#3B82F6"];
@@ -375,10 +381,49 @@ async function chat(system, user, { json=false, temperature=0.4, model=null } = 
   return data.choices?.[0]?.message?.content ?? "";
 }
 
-/* ===================== ANEXO DE IMAGENS / OCR ===================== */
-const MAX_SIDE = 1600, MAX_IMAGES = 8;
+/* ===================== ANEXOS: EXTRAÇÃO DE TEXTO ===================== */
+const MAX_SIDE = 1600, MAX_FILES = 12, MIN_PDF_CHARS = 40;
 
-function downscale(file){
+const LIBS = {
+  pdf:     { url:"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",        check:() => window.pdfjsLib },
+  jszip:   { url:"https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",         check:() => window.JSZip },
+  mammoth: { url:"https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js", check:() => window.mammoth },
+  xlsx:    { url:"https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js",      check:() => window.XLSX }
+};
+const loaded = {};
+function loadLib(name){
+  const l = LIBS[name];
+  if (l.check()) return Promise.resolve();
+  if (loaded[name]) return loaded[name];
+  loaded[name] = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = l.url;
+    s.onload = () => {
+      if (name === "pdf" && window.pdfjsLib)
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      res();
+    };
+    s.onerror = () => rej(new Error(`Não consegui carregar a biblioteca de leitura (${name}). Verifique a conexão.`));
+    document.head.appendChild(s);
+  });
+  return loaded[name];
+}
+
+const EXT = f => (f.name.split('.').pop() || "").toLowerCase();
+const KIND = f => {
+  if (f.type.startsWith('image/')) return "image";
+  const e = EXT(f);
+  if (e === "pdf") return "pdf";
+  if (e === "docx" || e === "doc") return "docx";
+  if (e === "pptx" || e === "ppt") return "pptx";
+  if (e === "xlsx" || e === "xls" || e === "csv") return "xlsx";
+  if (e === "txt" || e === "md") return "text";
+  return null;
+};
+const ICON = { image:"🖼️", pdf:"📕", docx:"📘", pptx:"📙", xlsx:"📗", text:"📄" };
+
+/* ---------- imagem: reduz e converte ---------- */
+function downscale(blob){
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -390,31 +435,138 @@ function downscale(file){
       resolve(c.toDataURL('image/jpeg', 0.85));
     };
     img.onerror = () => reject(new Error("Não consegui ler a imagem."));
-    img.src = URL.createObjectURL(file);
+    img.src = URL.createObjectURL(blob);
   });
 }
 
-async function addFiles(files){
-  const imgs = [...files].filter(f => f.type.startsWith('image/'));
-  if (!imgs.length) return;
-  for (const f of imgs) {
-    if (S.images.length >= MAX_IMAGES) { $('ocr-status').textContent = `Limite de ${MAX_IMAGES} imagens por vez.`; break; }
-    try { S.images.push({ name: f.name, data: await downscale(f) }); }
-    catch(e){ $('ocr-status').textContent = e.message; }
+/* ---------- extratores ---------- */
+const SYS_OCR = `Você transcreve o texto de imagens de material de estudo (páginas de livro, quadro, caderno, slides).
+Devolva SOMENTE o texto presente na imagem, em português do Brasil, preservando a ordem de leitura, títulos e listas.
+Não resuma, não comente, não explique, não invente conteúdo ausente. Se a imagem não tiver texto legível, responda exatamente: [sem texto legível]`;
+
+async function ocrDataUrl(dataUrl, visionModel){
+  const txt = await chat(SYS_OCR, [
+    { type:"text", text:"Transcreva todo o texto desta imagem." },
+    { type:"image_url", image_url:{ url: dataUrl } }
+  ], { temperature:0.1, model: visionModel });
+  const clean = String(txt).trim();
+  return (!clean || clean === "[sem texto legível]") ? "" : clean;
+}
+
+async function extractPdf(file, setStat){
+  await loadLib('pdf');
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+  const out = [];
+  let scanned = 0;
+  for (let p = 1; p <= doc.numPages; p++) {
+    setStat(`página ${p} de ${doc.numPages}...`, 'busy');
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    let txt = tc.items.map(i => i.str).join(" ").replace(/\s+/g, " ").trim();
+    if (txt.length < MIN_PDF_CHARS) {           // página escaneada → OCR por imagem
+      const vm = pickVisionModel();
+      if (vm) {
+        setStat(`página ${p} parece escaneada, lendo por imagem...`, 'busy');
+        const vp = page.getViewport({ scale: 2 });
+        const c = document.createElement('canvas');
+        c.width = vp.width; c.height = vp.height;
+        await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+        const r = Math.min(1, MAX_SIDE / Math.max(c.width, c.height));
+        let url;
+        if (r < 1) {
+          const c2 = document.createElement('canvas');
+          c2.width = Math.round(c.width * r); c2.height = Math.round(c.height * r);
+          c2.getContext('2d').drawImage(c, 0, 0, c2.width, c2.height);
+          url = c2.toDataURL('image/jpeg', 0.85);
+        } else url = c.toDataURL('image/jpeg', 0.85);
+        txt = await ocrDataUrl(url, vm.id);
+        if (txt) scanned++;
+      }
+    }
+    if (txt) out.push(txt);
   }
-  renderThumbs();
+  if (!out.length) throw new Error("PDF sem texto extraível (e sem modelo de visão disponível para OCR).");
+  return { text: out.join("\n\n"), note: scanned ? `${doc.numPages} pág., ${scanned} por OCR` : `${doc.numPages} pág.` };
 }
 
-function renderThumbs(){
-  const box = $('thumbs'); box.innerHTML = "";
-  S.images.forEach((im, i) => {
-    const d = document.createElement('div'); d.className = 'thumb';
-    d.innerHTML = `<img src="${im.data}" alt="${esc(im.name)}"><button type="button" title="Remover">×</button>`;
-    d.querySelector('button').onclick = () => { S.images.splice(i, 1); renderThumbs(); };
-    box.appendChild(d);
+async function extractDocx(file){
+  await loadLib('mammoth');
+  const r = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+  const t = (r.value || "").replace(/\n{3,}/g, "\n\n").trim();
+  if (!t) throw new Error("Documento sem texto. Arquivos .doc antigos não são suportados — salve como .docx.");
+  return { text: t, note: "" };
+}
+
+async function extractPptx(file){
+  await loadLib('jszip');
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const names = Object.keys(zip.files)
+    .filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+    .sort((a, b) => (+a.match(/\d+/)[0]) - (+b.match(/\d+/)[0]));
+  if (!names.length) throw new Error("Sem slides legíveis. Arquivos .ppt antigos não são suportados — salve como .pptx.");
+  const parser = new DOMParser();
+  const out = [];
+  for (let i = 0; i < names.length; i++) {
+    const xml = parser.parseFromString(await zip.files[names[i]].async("string"), "application/xml");
+    const runs = [...xml.getElementsByTagName("a:t")].map(n => n.textContent.trim()).filter(Boolean);
+    if (runs.length) out.push(`--- Slide ${i + 1} ---\n` + runs.join("\n"));
+  }
+  if (!out.length) throw new Error("Slides sem texto (podem ser só imagens).");
+  return { text: out.join("\n\n"), note: `${names.length} slides` };
+}
+
+async function extractXlsx(file){
+  await loadLib('xlsx');
+  const wb = XLSX.read(await file.arrayBuffer(), { type:"array" });
+  const out = [];
+  wb.SheetNames.forEach(n => {
+    const csv = XLSX.utils.sheet_to_csv(wb.Sheets[n]).replace(/(\n\s*,*\s*)+\n/g, "\n").trim();
+    if (csv) out.push(`--- Planilha: ${n} ---\n${csv}`);
   });
-  $('ocr-btn').classList.toggle('hidden', !S.images.length);
-  if (!S.images.length) $('ocr-status').textContent = "";
+  if (!out.length) throw new Error("Planilha vazia.");
+  return { text: out.join("\n\n"), note: `${wb.SheetNames.length} aba(s)` };
+}
+
+async function extractText(file){
+  const t = (await file.text()).trim();
+  if (!t) throw new Error("Arquivo vazio.");
+  return { text: t, note: "" };
+}
+
+async function extractImage(item){
+  const vm = pickVisionModel();
+  if (!vm) throw new Error("Nenhum modelo com leitura de imagem disponível. Desmarque 'apenas gratuitos' ou recarregue os modelos.");
+  const t = await ocrDataUrl(item.dataUrl, vm.id);
+  if (!t) throw new Error("Sem texto legível. Tente uma foto mais nítida.");
+  return { text: t, note: vm.borrowed ? `via ${vm.name}` : "" };
+}
+
+/* ---------- lista de arquivos ---------- */
+async function addFiles(files){
+  for (const f of [...files]) {
+    if (S.files.length >= MAX_FILES) { $('ocr-status').textContent = `Limite de ${MAX_FILES} arquivos por vez.`; break; }
+    const kind = KIND(f);
+    if (!kind) { S.files.push({ name:f.name, kind:"text", file:f, status:"Formato não suportado.", state:"err" }); continue; }
+    const item = { name:f.name, kind, file:f, status:"Pronto para extrair.", state:"" };
+    if (kind === "image") { try { item.dataUrl = await downscale(f); } catch(e){ item.status = e.message; item.state = "err"; } }
+    S.files.push(item);
+  }
+  renderFiles();
+}
+
+function renderFiles(){
+  const ul = $('filelist'); ul.innerHTML = "";
+  S.files.forEach((it, i) => {
+    const li = document.createElement('li'); li.className = 'filerow';
+    li.innerHTML = (it.dataUrl ? `<img class="fthumb" src="${it.dataUrl}" alt="">` : `<span class="ficon">${ICON[it.kind] || "📄"}</span>`)
+      + `<span class="fmeta"><span class="fname">${esc(it.name)}</span><span class="fstat ${it.state}">${esc(it.status)}</span></span>`
+      + `<button type="button" title="Remover">×</button>`;
+    li.querySelector('button').onclick = () => { S.files.splice(i, 1); renderFiles(); };
+    ul.appendChild(li);
+  });
+  $('ocr-btn').classList.toggle('hidden', !S.files.length);
+  if (!S.files.length) $('ocr-status').textContent = "";
 }
 
 $('dropzone').addEventListener('click', () => $('file-input').click());
@@ -423,48 +575,53 @@ $('file-input').addEventListener('change', e => { addFiles(e.target.files); e.ta
 ['dragleave','drop'].forEach(ev => $('dropzone').addEventListener(ev, e => { e.preventDefault(); $('dropzone').classList.remove('over'); }));
 $('dropzone').addEventListener('drop', e => addFiles(e.dataTransfer.files));
 document.addEventListener('paste', e => {
-  const files = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile()).filter(Boolean);
-  if (files.length) { e.preventDefault(); addFiles(files); }
+  const fs = [...(e.clipboardData?.items || [])].filter(i => i.kind === "file").map(i => i.getAsFile()).filter(Boolean);
+  if (fs.length) { e.preventDefault(); addFiles(fs); }
 });
 
 function pickVisionModel(){
   const current = S.models.find(m => m.id === S.model);
-  if (current && isVision(current)) return { id: S.model, borrowed: false };
+  if (current && isVision(current)) return { id: S.model, borrowed: false, name: S.model };
   const pool = S.models.filter(isVision);
   const free = pool.filter(isFree);
   const chosen = (S.onlyFree ? free : (free.length ? free : pool))[0] || pool[0];
   return chosen ? { id: chosen.id, borrowed: true, name: chosen.name || chosen.id } : null;
 }
 
-const SYS_OCR = `Você transcreve o texto de imagens de material de estudo (páginas de livro, quadro, caderno, slides).
-Devolva SOMENTE o texto presente na imagem, em português do Brasil, preservando a ordem de leitura, títulos e listas.
-Não resuma, não comente, não explique, não invente conteúdo ausente. Se a imagem não tiver texto legível, responda exatamente: [sem texto legível]`;
-
+/* ---------- extração ---------- */
 $('ocr-btn').addEventListener('click', async () => {
-  if (!S.apiKey) { $('ai-config').open = true; $('ocr-status').textContent = "Informe a chave da API na configuração acima."; return; }
-  const vm = pickVisionModel();
-  if (!vm) { $('ocr-status').textContent = "Nenhum modelo com leitura de imagem disponível. Desmarque 'apenas gratuitos' ou recarregue os modelos."; return; }
-
+  if (!S.apiKey && S.files.some(f => f.kind === "image")) {
+    $('ai-config').open = true;
+    $('ocr-status').textContent = "Imagens precisam da chave da API para transcrição. Informe-a na configuração acima.";
+    return;
+  }
   $('ocr-btn').disabled = true;
   $('ocr-loader').classList.remove('hidden');
   $('ocr-status').textContent = "";
-  const parts = [];
 
-  for (let i = 0; i < S.images.length; i++) {
-    $('ocr-loader-text').textContent = `Lendo imagem ${i+1} de ${S.images.length}...`;
+  const parts = [];
+  const pending = S.files.filter(f => f.state !== "done");
+
+  for (let i = 0; i < pending.length; i++) {
+    const it = pending[i];
+    const setStat = (msg, state) => { it.status = msg; it.state = state || ""; renderFiles(); };
+    $('ocr-loader-text').textContent = `Arquivo ${i+1} de ${pending.length}: ${it.name}`;
+    setStat("Extraindo...", "busy");
     try {
-      const txt = await chat(SYS_OCR, [
-        { type:"text", text:"Transcreva todo o texto desta imagem." },
-        { type:"image_url", image_url:{ url: S.images[i].data } }
-      ], { temperature:0.1, model: vm.id });
-      const clean = String(txt).trim();
-      if (clean && clean !== "[sem texto legível]") parts.push(clean);
+      let r;
+      if (it.kind === "pdf")        r = await extractPdf(it.file, setStat);
+      else if (it.kind === "docx")  r = await extractDocx(it.file);
+      else if (it.kind === "pptx")  r = await extractPptx(it.file);
+      else if (it.kind === "xlsx")  r = await extractXlsx(it.file);
+      else if (it.kind === "image") r = await extractImage(it);
+      else                          r = await extractText(it.file);
+      it.state = "done";
+      const chars = r.text.length.toLocaleString('pt-BR');
+      setStat(`✓ ${chars} caracteres${r.note ? " · " + r.note : ""}`, "ok");
+      it.state = "done";
+      parts.push(`### ${it.name}\n${r.text}`);
     } catch(e){
-      $('ocr-loader').classList.add('hidden');
-      $('ocr-btn').disabled = false;
-      $('ocr-status').style.color = "#B91C1C";
-      $('ocr-status').textContent = `Erro ao ler a imagem ${i+1}: ${e.message}`;
-      return;
+      setStat("✗ " + e.message, "err");
     }
   }
 
@@ -473,16 +630,14 @@ $('ocr-btn').addEventListener('click', async () => {
 
   if (!parts.length) {
     $('ocr-status').style.color = "#B91C1C";
-    $('ocr-status').textContent = "Nenhum texto legível encontrado. Tente fotos mais nítidas ou com mais luz.";
+    $('ocr-status').textContent = "Nenhum texto extraído. Veja o motivo em cada arquivo acima.";
     return;
   }
-
   const ta = $('study-text');
   ta.value = (ta.value.trim() ? ta.value.trim() + "\n\n" : "") + parts.join("\n\n");
   ta.scrollTop = ta.scrollHeight;
-  S.images = []; renderThumbs();
   $('ocr-status').style.color = "#15803D";
-  $('ocr-status').textContent = `Texto extraído e adicionado acima${vm.borrowed ? ` (via ${vm.name})` : ""}. Revise antes de gerar o quiz.`;
+  $('ocr-status').textContent = `${parts.length} arquivo(s) processado(s). Revise o texto acima antes de gerar o quiz.`;
 });
 
 function parseJson(raw){
@@ -712,7 +867,7 @@ $('restart-btn').addEventListener('click', () => {
   $('rounds').innerHTML = ""; $('summary-body').innerHTML = "";
   $('quiz-stage').classList.add('hidden'); $('summary-stage').classList.add('hidden');
   $('restart-btn').classList.add('hidden'); $('start-btn').disabled = false;
-  $('study-text').value = ""; S.images = []; renderThumbs(); $('ocr-status').textContent = ""; $('study-text').focus();
+  $('study-text').value = ""; S.files = []; renderFiles(); $('ocr-status').textContent = ""; $('study-text').focus();
   window.scrollTo({ top:0, behavior:'smooth' });
 });
 </script>
