@@ -47,7 +47,9 @@
   textarea{min-height:190px; resize:vertical; line-height:1.5;}
   .row{display:flex; gap:12px; flex-wrap:wrap;}
   .row > *{flex:1; min-width:160px;}
-  .help{font-size:11px; color:#9C94B8; margin-top:4px;}
+  .help{font-size:11px; color:#9C94B8; margin-top:4px; line-height:1.5;}
+  .help a{color:var(--purple); font-weight:600; text-decoration:underline; text-underline-offset:2px;}
+  .help a:hover{color:var(--pink);}
 
   /* ---------- Buttons ---------- */
   .btn{
@@ -144,6 +146,7 @@
   .loader{display:flex; align-items:center; gap:12px; font-size:13px; font-weight:600; color:var(--muted); padding:14px 0;}
   .spinner{width:22px; height:22px; border:3px solid var(--soft); border-top-color:var(--purple); border-radius:50%; animation:spin .8s linear infinite; flex-shrink:0;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  .error-box a{color:#B91C1C; font-weight:700; text-decoration:underline;}
   .error-box{font-size:12.5px; color:#B91C1C; background:#FEE2E2; border-radius:12px; padding:10px 12px; margin-top:10px; line-height:1.45; white-space:pre-wrap;}
   .hint{font-size:11px; color:#9C94B8; text-align:center; margin-top:8px;}
   /* ---------- Filtro / anexos ---------- */
@@ -189,7 +192,7 @@
     <div id="key-wrap">
       <label class="field" for="api-key">Chave da API OpenRouter</label>
       <input type="password" id="api-key" placeholder="sk-or-v1-..." autocomplete="off">
-      <div class="help">Obtenha em <b>openrouter.ai/keys</b>. A chave fica guardada só neste navegador e é enviada direto para o OpenRouter.</div>
+      <div class="help">Não tem chave? <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">Crie uma gratuita em openrouter.ai/keys ↗</a><br>A chave fica guardada só neste navegador e é enviada direto para o OpenRouter.</div>
     </div>
 
     <label class="field" for="model-select">Modelo de IA</label>
@@ -326,7 +329,9 @@ function populateModels(list){
     const name = typeof m === "string" ? m : (m.name || m.id);
     const o = document.createElement('option');
     o.value = id;
-    o.textContent = (isVision(m) ? "🖼 " : "") + name + (isFree(m) ? "  · grátis" : "");
+    const sp = (typeof m === "string" ? [] : (m.supported_parameters || []));
+    const tag = sp.includes("structured_outputs") ? " ⚙" : "";
+    o.textContent = (isVision(m) ? "🖼 " : "") + name + tag + (isFree(m) ? "  · grátis" : "");
     sel.appendChild(o);
   });
   if (!sel.options.length) { S.model = ""; return; }
@@ -343,8 +348,9 @@ function renderModels(){
   }
   populateModels(filtered);
   const vis = filtered.filter(isVision).length;
-  $('model-help').textContent = S.models.length
-    ? `${filtered.length} modelo(s)${S.onlyFree ? " gratuito(s)" : ""} · ${vis} com leitura de imagem 🖼`
+  const strict = filtered.filter(m => typeof m !== "string" && (m.supported_parameters || []).includes("structured_outputs")).length;
+  $('model-help').innerHTML = S.models.length
+    ? `${filtered.length} modelo(s)${S.onlyFree ? " gratuito(s)" : ""} · ${vis} leem imagem 🖼 · ${strict} aceitam schema estrito ⚙<br><span style="color:#9C94B8">⚙ = quiz sai no formato exato, sem depender do modelo obedecer o prompt.</span>`
     : "Lista padrão. Informe a chave para carregar todos os modelos.";
 }
 
@@ -353,7 +359,7 @@ renderModels();
 
 async function loadModels(){
   const err = $('config-error'); err.classList.add('hidden');
-  if (!S.apiKey) { err.textContent = "Informe a chave da API primeiro."; err.classList.remove('hidden'); return; }
+  if (!S.apiKey) { err.innerHTML = 'Informe a chave da API primeiro. <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">Criar chave ↗</a>'; err.classList.remove('hidden'); return; }
   $('model-help').textContent = "Carregando modelos...";
   try {
     const r = await fetch("https://openrouter.ai/api/v1/models", { headers:{ Authorization:"Bearer " + S.apiKey } });
@@ -374,19 +380,68 @@ async function loadModels(){
 if (S.apiKey) loadModels();
 
 
-async function chat(system, user, { json=false, temperature=0.4, model=null } = {}){
-  if (!S.apiKey) throw new Error("Chave da API OpenRouter não informada.");
-  const body = { model: model || S.model, temperature, max_tokens: 4000,
-    messages: [{ role:"system", content:system }, { role:"user", content:user }] };
-  if (json) body.response_format = { type:"json_object" };
+/* ---------- capacidades do modelo (lidas da própria API) ---------- */
+function supports(modelId, param){
+  const m = S.models.find(x => x.id === modelId);
+  return !!m && (m.supported_parameters || []).includes(param);
+}
+// "schema" = json_schema estrito | "json" = json_object | "prompt" = só instrução no prompt
+function jsonMode(modelId){
+  if (supports(modelId, "structured_outputs")) return "schema";
+  if (supports(modelId, "response_format"))    return "json";
+  return "prompt";
+}
+
+const MODE_LABEL = { schema:"schema estrito", json:"modo JSON", prompt:"instrução no prompt" };
+
+async function rawCall(body){
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method:"POST",
     headers:{ "Content-Type":"application/json", Authorization:"Bearer " + S.apiKey, "HTTP-Referer": location.origin, "X-Title":"EstudaMais" },
     body: JSON.stringify(body)
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok || data.error) throw new Error(data.error?.message || `HTTP ${r.status}`);
-  return data.choices?.[0]?.message?.content ?? "";
+  if (!r.ok || data.error) {
+    const e = new Error(data.error?.message || `HTTP ${r.status}`);
+    e.status = r.status;
+    throw e;
+  }
+  return data;
+}
+
+async function chat(system, user, { json=false, schema=null, temperature=0.4, model=null } = {}){
+  if (!S.apiKey) throw new Error("Chave da API OpenRouter não informada.");
+  const id = model || S.model;
+  const base = { model:id, temperature, max_tokens:4000,
+    messages:[{ role:"system", content:system }, { role:"user", content:user }] };
+
+  // ordem de tentativa: do mais garantido ao mais permissivo
+  const chain = [];
+  if (schema) {
+    const mode = jsonMode(id);
+    if (mode === "schema") chain.push({ mode:"schema", body:{ ...base, response_format:{ type:"json_schema", json_schema:schema } } });
+    if (mode !== "prompt") chain.push({ mode:"json",   body:{ ...base, response_format:{ type:"json_object" } } });
+    chain.push({ mode:"prompt", body:base });
+  } else if (json) {
+    if (jsonMode(id) !== "prompt") chain.push({ mode:"json", body:{ ...base, response_format:{ type:"json_object" } } });
+    chain.push({ mode:"prompt", body:base });
+  } else {
+    chain.push({ mode:"prompt", body:base });
+  }
+
+  let lastErr = null;
+  for (const step of chain) {
+    try {
+      const data = await rawCall(step.body);
+      S.lastMode = step.mode;
+      return data.choices?.[0]?.message?.content ?? "";
+    } catch(e){
+      lastErr = e;
+      // 400/404/422 = modelo recusou o formato → tenta o próximo nível
+      if (![400, 404, 422].includes(e.status)) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 /* ===================== ANEXOS: EXTRAÇÃO DE TEXTO ===================== */
@@ -650,6 +705,36 @@ $('ocr-btn').addEventListener('click', async () => {
   updateClearBtn();
 });
 
+/* ---------- schema do quiz (json_schema estrito) ---------- */
+const QUIZ_SCHEMA = {
+  name: "quiz",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["questions"],
+    properties: {
+      questions: {
+        type: "array",
+        description: "As perguntas geradas, na ordem em que devem ser exibidas.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["q", "options", "correct", "explanation", "concept", "format"],
+          properties: {
+            q:           { type:"string",  description:"Enunciado da pergunta." },
+            options:     { type:"array", items:{ type:"string" }, description:"Exatamente 4 alternativas." },
+            correct:     { type:"integer", description:"Índice (0 a 3) da alternativa correta dentro de options." },
+            explanation: { type:"string",  description:"Por que a correta está certa e por que as outras estão erradas." },
+            concept:     { type:"string",  description:"Conceito avaliado, em 3 a 6 palavras." },
+            format:      { type:"string",  description:"Formato da pergunta, ex.: múltipla escolha, situação-problema, complete a lacuna." }
+          }
+        }
+      }
+    }
+  }
+};
+
 function parseJson(raw){
   let t = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
   const a = t.indexOf("{"), b = t.lastIndexOf("}");
@@ -698,7 +783,13 @@ $('start-btn').addEventListener('click', async () => {
   S.text = $('study-text').value.trim();
   S.level = $('difficulty').value;
   const n = parseInt($('num-questions').value, 10);
-  if (!S.apiKey) { $('ai-config').open = true; return showErr('input-error', "Informe a chave da API OpenRouter na configuração acima."); }
+  if (!S.apiKey) {
+    $('ai-config').open = true;
+    $('input-error').innerHTML = 'Informe a chave da API na configuração acima. <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">Criar chave no OpenRouter ↗</a>';
+    $('input-error').classList.remove('hidden');
+    $('ai-config').scrollIntoView({ behavior:'smooth', block:'center' });
+    return;
+  }
   if (S.text.length < 40) return showErr('input-error', "Cole um conteúdo com pelo menos algumas frases.");
   if (!Number.isInteger(n) || n < 1 || n > 30) return showErr('input-error', "Quantidade de perguntas deve ser entre 1 e 30.");
   S.n = n;
@@ -755,7 +846,8 @@ async function generateRound({ first=false, missed=[] } = {}){
   let questions = null, lastErr = null;
   for (let attempt = 0; attempt < 2 && !questions; attempt++) {
     try {
-      const raw = await chat(first ? SYS_QUIZ(S.level, k) : SYS_RETRY(S.level, k), userMsg, { json:true, temperature: attempt ? 0.7 : 0.5 });
+      const raw = await chat(first ? SYS_QUIZ(S.level, k) : SYS_RETRY(S.level, k), userMsg,
+        { schema: QUIZ_SCHEMA, temperature: attempt ? 0.7 : 0.5 });
       questions = validateQuestions(parseJson(raw).questions, k);
     } catch(e){ lastErr = e; }
   }
@@ -767,7 +859,7 @@ async function generateRound({ first=false, missed=[] } = {}){
     $('quiz-error').appendChild(b);
     return;
   }
-  S.rounds.push({ questions, corrected:false });
+  S.rounds.push({ questions, corrected:false, mode: MODE_LABEL[S.lastMode] || "" });
   renderRound(S.rounds.length - 1);
 }
 
@@ -777,7 +869,7 @@ function renderRound(ri){
   wrap.innerHTML = `
     <div class="round-title">
       <h2>${ri === 0 ? "🎯 Quiz" : `🔁 Rodada ${ri+1} · reforço`}</h2>
-      <span class="pill">${round.questions.length} pergunta(s)</span>
+      <span class="pill">${round.questions.length} pergunta(s)${round.mode ? " · " + round.mode : ""}</span>
     </div>
     <form id="form-${ri}"></form>
     <button class="btn purple" id="check-${ri}" type="button">✅ Corrigir minhas respostas</button>
