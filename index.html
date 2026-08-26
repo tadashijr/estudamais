@@ -232,10 +232,10 @@
       <div>
         <label class="field" for="difficulty">Nível</label>
         <select id="difficulty">
-          <option value="fundamental 1 (6 a 10 anos)">Fundamental 1</option>
-          <option value="fundamental 2 (11 a 14 anos)" selected>Fundamental 2</option>
-          <option value="ensino médio">Ensino médio</option>
-          <option value="superior / técnico">Superior / técnico</option>
+          <option value="f1">Fundamental 1 · 6 a 10 anos</option>
+          <option value="f2" selected>Fundamental 2 · 11 a 14 anos</option>
+          <option value="em">Ensino médio</option>
+          <option value="sup">Superior / técnico</option>
         </select>
       </div>
     </div>
@@ -706,34 +706,43 @@ $('ocr-btn').addEventListener('click', async () => {
 });
 
 /* ---------- schema do quiz (json_schema estrito) ---------- */
-const QUIZ_SCHEMA = {
-  name: "quiz",
-  strict: true,
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    required: ["questions"],
-    properties: {
-      questions: {
-        type: "array",
-        description: "As perguntas geradas, na ordem em que devem ser exibidas.",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["q", "options", "correct", "explanation", "concept", "format"],
-          properties: {
-            q:           { type:"string",  description:"Enunciado da pergunta." },
-            options:     { type:"array", items:{ type:"string" }, description:"Exatamente 4 alternativas." },
-            correct:     { type:"integer", description:"Índice (0 a 3) da alternativa correta dentro de options." },
-            explanation: { type:"string",  description:"Por que a correta está certa e por que as outras estão erradas." },
-            concept:     { type:"string",  description:"Conceito avaliado, em 3 a 6 palavras." },
-            format:      { type:"string",  description:"Formato da pergunta, ex.: múltipla escolha, situação-problema, complete a lacuna." }
+function quizSchema(level, n){
+  const L = lv(level);
+  return {
+    name: "quiz",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["questions"],
+      properties: {
+        questions: {
+          type: "array",
+          description: `Exatamente ${n} perguntas para ${L.aluno}, na ordem em que devem ser exibidas.`,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["q", "options", "correct", "explanation", "concept", "format"],
+            properties: {
+              q: { type:"string",
+                   description:`Enunciado da pergunta, escrito para ${L.aluno}. ${L.enunciado} ${L.linguagem} Nível cognitivo exigido: ${L.cognicao}` },
+              options: { type:"array", items:{ type:"string" },
+                   description:`Exatamente 4 alternativas, apenas uma correta. ${L.alternativas}` },
+              correct: { type:"integer",
+                   description:"Índice (0, 1, 2 ou 3) da alternativa correta dentro de options." },
+              explanation: { type:"string",
+                   description:`Por que a correta está certa e por que cada uma das outras está errada. ${L.explicacao}` },
+              concept: { type:"string",
+                   description:"Conceito avaliado pela pergunta, em 3 a 6 palavras." },
+              format: { type:"string",
+                   description:"Formato usado, ex.: múltipla escolha, situação-problema, complete a lacuna, qual afirmação é falsa, causa e consequência." }
+            }
           }
         }
       }
     }
-  }
-};
+  };
+}
 
 function parseJson(raw){
   let t = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
@@ -754,19 +763,79 @@ function validateQuestions(list, n){
 }
 
 /* ===================== PROMPTS ===================== */
-const SYS_SUMMARY = (level) => `Você é um professor que explica de forma clara para alunos de ${level}.
-Faça um resumo objetivo do conteúdo enviado, em português do Brasil.
+/* ---------- diretrizes por nível escolar ---------- */
+const LEVELS = {
+  f1: {
+    nome: "Fundamental 1 (6 a 10 anos)",
+    aluno: "criança de 6 a 10 anos, no início da alfabetização plena",
+    linguagem: "frases curtas (máx. 15 palavras), vocabulário do cotidiano, nenhum termo técnico sem explicação imediata entre parênteses. Trate o aluno por 'você'.",
+    cognicao: "reconhecer, nomear e lembrar. Pergunte fatos diretos que estão explícitos no texto. Nada de inferência, comparação abstrata ou cálculo em várias etapas.",
+    enunciado: "no máximo 2 linhas, uma única ideia por pergunta, sem negativas ('qual NÃO é...') que confundem nessa idade.",
+    alternativas: "curtas (até 8 palavras), claramente diferentes entre si, sem pegadinha de detalhe mínimo.",
+    explicacao: "2 ou 3 frases simples, com um exemplo concreto do dia a dia."
+  },
+  f2: {
+    nome: "Fundamental 2 (11 a 14 anos)",
+    aluno: "adolescente de 11 a 14 anos",
+    linguagem: "linguagem clara e direta; termos técnicos do conteúdo são bem-vindos, sempre com o significado explicado na primeira aparição.",
+    cognicao: "compreender e aplicar. Misture perguntas de definição com perguntas que peçam usar o conceito num exemplo novo. Relações de causa e efeito são adequadas.",
+    enunciado: "2 a 3 linhas, pode incluir um contexto curto antes da pergunta.",
+    alternativas: "distratores plausíveis que reflitam confusões comuns nessa faixa, não opções obviamente absurdas.",
+    explicacao: "3 a 4 frases: por que a correta está certa e qual foi o raciocínio errado que leva a cada distrator."
+  },
+  em: {
+    nome: "Ensino médio",
+    aluno: "estudante de ensino médio, possivelmente se preparando para vestibular ou ENEM",
+    linguagem: "registro formal, terminologia técnica usada com precisão e sem paráfrase infantilizada.",
+    cognicao: "aplicar, analisar e interpretar. Exija leitura de situação-problema, distinção entre conceitos próximos e identificação de premissas.",
+    enunciado: "pode trazer um trecho, dado ou cenário antes da pergunta, no estilo de prova de vestibular.",
+    alternativas: "distratores construídos sobre erros conceituais reais, incluindo respostas parcialmente corretas que falham num detalhe decisivo.",
+    explicacao: "4 a 5 frases, nomeando o conceito envolvido e o erro específico de cada alternativa incorreta."
+  },
+  sup: {
+    nome: "Superior / técnico",
+    aluno: "estudante de graduação ou curso técnico",
+    linguagem: "vocabulário técnico da área sem simplificação; pressuponha os pré-requisitos usuais do curso.",
+    cognicao: "analisar, avaliar e transferir. Priorize casos limítrofes, exceções à regra, comparação entre abordagens e consequências de escolhas técnicas.",
+    enunciado: "pode ser extenso, com cenário técnico, trecho de código, dado experimental ou situação profissional.",
+    alternativas: "todas defensáveis à primeira leitura; a distinção deve depender de um critério técnico preciso.",
+    explicacao: "explicação densa, citando o princípio que decide a questão e por que cada alternativa falha, inclusive as quase certas."
+  }
+};
+const lv = k => LEVELS[k] || LEVELS.f2;
+
+const nivelBloco = k => {
+  const L = lv(k);
+  return `PÚBLICO-ALVO: ${L.aluno}.
+LINGUAGEM: ${L.linguagem}
+NÍVEL COGNITIVO: ${L.cognicao}
+ENUNCIADOS: ${L.enunciado}
+ALTERNATIVAS: ${L.alternativas}
+EXPLICAÇÕES: ${L.explicacao}`;
+};
+
+const SYS_SUMMARY = (level) => `Você é um professor experiente preparando material de estudo.
+
+${nivelBloco(level)}
+
+TAREFA: resuma o conteúdo enviado em português do Brasil, ajustando linguagem e profundidade ao público-alvo acima.
 Formato: um parágrafo curto de contexto, depois uma lista com os pontos mais importantes (use "- " no início de cada linha).
 Destaque termos-chave entre **asteriscos duplos**. Não invente informação que não está no texto. Máximo de 12 itens.`;
 
-const SYS_QUIZ = (level, n) => `Você cria quizzes de múltipla escolha para alunos de ${level}, em português do Brasil.
-Gere EXATAMENTE ${n} perguntas sobre o conteúdo enviado. Cada pergunta deve ter 4 alternativas, apenas uma correta.
-Distribua dificuldade progressiva (fácil → difícil). As alternativas erradas devem ser plausíveis.
+const SYS_QUIZ = (level, n) => `Você elabora avaliações de múltipla escolha em português do Brasil.
+
+${nivelBloco(level)}
+
+TAREFA: gere EXATAMENTE ${n} perguntas sobre o conteúdo enviado, com 4 alternativas cada e apenas uma correta.
+Distribua dificuldade progressiva (fácil → difícil) DENTRO do nível cognitivo definido acima — não suba nem desça de faixa.
 Responda SOMENTE com JSON válido, sem texto antes ou depois, no formato:
 {"questions":[{"q":"enunciado","options":["A","B","C","D"],"correct":0,"explanation":"por que a correta está certa e as outras erradas","concept":"conceito em 3-6 palavras","format":"múltipla escolha"}]}
 "correct" é o índice (0-3) da alternativa certa. A lista "questions" deve ter exatamente ${n} itens.`;
 
-const SYS_RETRY = (level, k) => `Você cria perguntas de reforço para alunos de ${level}, em português do Brasil.
+const SYS_RETRY = (level, k) => `Você elabora perguntas de reforço em português do Brasil.
+
+${nivelBloco(level)}
+
 O aluno errou ${k} pergunta(s). Para CADA erro listado, gere UMA nova pergunta sobre o MESMO conceito, mas com abordagem diferente da original.
 Varie o formato entre: "situação-problema" (aplicar o conceito num caso concreto), "complete a lacuna", "qual afirmação é falsa", "verdadeiro ou falso" (opções: Verdadeiro/Falso + 2 distratores explicativos), "compare e contraste", "causa e consequência".
 Nunca repita o enunciado nem as mesmas alternativas da pergunta original. Use 4 alternativas, apenas uma correta.
@@ -847,7 +916,7 @@ async function generateRound({ first=false, missed=[] } = {}){
   for (let attempt = 0; attempt < 2 && !questions; attempt++) {
     try {
       const raw = await chat(first ? SYS_QUIZ(S.level, k) : SYS_RETRY(S.level, k), userMsg,
-        { schema: QUIZ_SCHEMA, temperature: attempt ? 0.7 : 0.5 });
+        { schema: quizSchema(S.level, k), temperature: attempt ? 0.7 : 0.5 });
       questions = validateQuestions(parseJson(raw).questions, k);
     } catch(e){ lastErr = e; }
   }
