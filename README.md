@@ -19,6 +19,26 @@ Na primeira vez, abra **⚙️ Configuração da IA** e cole sua chave do OpenRo
 
 Depois: cole o conteúdo, escolha a quantidade de perguntas e o nível, e clique em gerar.
 
+## Limpar e recomeçar
+
+O botão **🧹 Limpar** fica ao lado de "Gerar resumo e quiz" e zera tudo: texto, anexos, resumo e rodadas do quiz. Fica desabilitado quando não há nada para limpar e pede confirmação se um estudo já estiver em andamento.
+
+Ao fechar um quiz com 100% de acerto, o botão **🔁 Estudar outro conteúdo** faz o mesmo.
+
+## Saída estruturada
+
+O quiz precisa voltar num formato exato para virar interface. A aplicação usa três níveis, escolhidos por modelo a partir do campo `supported_parameters` da própria API do OpenRouter:
+
+| Nível | Quando | Como |
+|---|---|---|
+| **Schema estrito** ⚙ | modelo aceita `structured_outputs` | `response_format: json_schema` com `strict: true` — a estrutura é imposta na decodificação, o modelo não consegue devolver formato inválido |
+| **Modo JSON** | modelo aceita `response_format` | `json_object` — garante JSON sintático, mas não os campos certos |
+| **Prompt** | demais modelos | só a instrução no system prompt |
+
+Se uma chamada em nível mais alto for recusada (400/404/422), cai automaticamente para o próximo. Modelos com ⚙ no seletor suportam o nível estrito; o rótulo ao lado de cada rodada do quiz mostra qual nível foi efetivamente usado.
+
+A validação no cliente (`validateQuestions`) continua ativa nos três níveis — schema estrito garante os tipos, não que o índice de `correct` aponte para uma alternativa existente ou que a quantidade de perguntas seja a pedida.
+
 ## Modelos gratuitos
 
 A caixa **"Mostrar apenas modelos gratuitos"** vem marcada. O filtro considera gratuito o modelo cujo id termina em `:free` ou cujo preço de entrada e saída é zero na resposta da API — ou seja, é lido da própria OpenRouter, não de uma lista fixa que envelhece.
