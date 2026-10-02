@@ -288,6 +288,15 @@ const CONFIG = {
     "meta-llama/llama-3.1-70b-instruct", "deepseek/deepseek-chat"
   ],
 
+  // Modelos gratuitos preferidos quando o modelo atual não está na lista (ordem de prioridade)
+  PREFERRED_FREE: [
+    "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free",
+    "deepseek/deepseek-chat-v3-0324:free", "mistralai/mistral-small-3.2-24b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free"
+  ],
+  // Classificadores de moderação: não geram texto, só devolvem "safe/unsafe"
+  NON_GENERATIVE: /guard|safety|moderation|shield|embed|rerank/i,
+
   // Teto de tokens de saída por chamada (o quiz escala até esse valor)
   MAX_TOKENS_CAP: 16000,
   // Fração mínima de perguntas válidas para aceitar a rodada parcial
@@ -341,11 +350,21 @@ function populateModels(list){
     sel.appendChild(o);
   });
   if (!sel.options.length) { S.model = ""; return; }
-  if ([...sel.options].some(o => o.value === S.model)) sel.value = S.model; else S.model = sel.value;
+  const ids = [...sel.options].map(o => o.value);
+  if (!ids.includes(S.model)) S.model = CONFIG.PREFERRED_FREE.find(id => ids.includes(id)) || ids[0];
+  sel.value = S.model;
+}
+
+/* Só modelos que geram texto: remove classificadores de segurança, embeddings e saída não-textual */
+function isUsable(m){
+  if (typeof m === "string") return !CONFIG.NON_GENERATIVE.test(m);
+  if (CONFIG.NON_GENERATIVE.test(m.id) || CONFIG.NON_GENERATIVE.test(m.name || "")) return false;
+  const out = m.architecture?.output_modalities;
+  return !out || out.includes("text");
 }
 
 function renderModels(){
-  const list = S.models.length ? S.models : CONFIG.FALLBACK_MODELS;
+  const list = (S.models.length ? S.models : CONFIG.FALLBACK_MODELS).filter(isUsable);
   const filtered = S.onlyFree ? list.filter(isFree) : list;
   if (S.onlyFree && !filtered.length) {
     populateModels(list);
@@ -464,6 +483,11 @@ async function chat(system, user, { json=false, schema=null, temperature=0.4, mo
         e.soft = true; throw e;
       }
 
+      if (isSafetyVerdict(text)) {
+        // erro terminal: trocar o modo de saída não muda a natureza do modelo
+        throw new Error(`O modelo "${id}" é um classificador de moderação (respondeu "${text.trim().slice(0, 60)}"), não gera conteúdo. Selecione outro modelo na Configuração da IA.`);
+      }
+
       if (!validate) { S.lastMode = step.mode; return text; }
 
       try {
@@ -553,7 +577,7 @@ async function ocrDataUrl(dataUrl, visionModel){
     { type:"text", text:"Transcreva todo o texto desta imagem." },
     { type:"image_url", image_url:{ url: dataUrl } }
   ], { temperature:0.1, model: visionModel });
-  const clean = stripThink(txt).trim();
+  const clean = cleanModelText(txt);
   return (!clean || clean === "[sem texto legível]") ? "" : clean;
 }
 
@@ -746,7 +770,20 @@ $('ocr-btn').addEventListener('click', async () => {
 });
 
 /* ---------- schema do quiz (json_schema estrito) ---------- */
+/* Remove quebras de linha e espaços duplicados de todas as strings do schema */
+function cleanSchema(node){
+  if (typeof node === "string") return node.replace(/\s+/g, " ").trim();
+  if (Array.isArray(node)) return node.map(cleanSchema);
+  if (node && typeof node === "object")
+    return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, cleanSchema(v)]));
+  return node;
+}
+
 function quizSchema(level, n){
+  return cleanSchema(buildQuizSchema(level, n));
+}
+
+function buildQuizSchema(level, n){
   const L = lv(level);
   return {
     name: "quiz",
@@ -788,12 +825,30 @@ function quizSchema(level, n){
 // Remove blocos de raciocínio que alguns modelos gratuitos embutem no conteúdo
 const stripThink = s => String(s ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^[\s\S]*?<\/think>/i, "");
 
+// Linhas de veredito de moderação ("User Safety: safe", "Response Safety: unsafe", "Safety Categories: ...")
+const SAFETY_LINE = /^\s*(user|response|prompt)?\s*safety(\s+categor(y|ies))?\s*:.*$/gim;
+const stripSafety = s => String(s ?? "").replace(SAFETY_LINE, "").replace(/^\s*(safe|unsafe)\s*$/gim, "");
+
+// true quando a resposta inteira é só um veredito de moderação, sem conteúdo
+function isSafetyVerdict(text){
+  const t = stripThink(text).trim();
+  return !!t && !stripSafety(t).trim() && /safe/i.test(t);
+}
+
+function cleanModelText(raw){
+  return stripSafety(stripThink(raw)).trim();
+}
+
 function parseJson(raw){
-  let t = stripThink(raw).trim()
+  let t = cleanModelText(raw)
     .replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-  const a = t.search(/[\[{]/);
-  const b = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
   if (a >= 0 && b > a) t = t.slice(a, b + 1);
+  else {
+    const a2 = t.indexOf("["), b2 = t.lastIndexOf("]");
+    if (a2 >= 0 && b2 > a2) t = t.slice(a2, b2 + 1);
+    else throw new Error(`A resposta não contém JSON: "${t.slice(0, 80)}${t.length > 80 ? "…" : ""}"`);
+  }
   try { return JSON.parse(t); }
   catch(_){
     // vírgulas sobrando antes de } ou ] são o erro mais comum de modelos menores
@@ -901,7 +956,8 @@ ${nivelBloco(level)}
 
 TAREFA: resuma o conteúdo enviado em português do Brasil, ajustando linguagem e profundidade ao público-alvo acima.
 Formato: um parágrafo curto de contexto, depois uma lista com os pontos mais importantes (use "- " no início de cada linha).
-Destaque termos-chave entre **asteriscos duplos**. Não invente informação que não está no texto. Máximo de 12 itens.`;
+Destaque termos-chave entre **asteriscos duplos**. Não invente informação que não está no texto. Máximo de 12 itens.
+Não emita relatórios, rótulos ou classificações de segurança/moderação. Responda apenas com o resumo.`;
 
 const SYS_QUIZ = (level, n) => `Você elabora avaliações de múltipla escolha em português do Brasil.
 
@@ -911,7 +967,8 @@ TAREFA: gere EXATAMENTE ${n} perguntas sobre o conteúdo enviado, com 4 alternat
 Distribua dificuldade progressiva (fácil → difícil) DENTRO do nível cognitivo definido acima — não suba nem desça de faixa.
 Responda SOMENTE com JSON válido, sem texto antes ou depois, sem blocos de código, no formato:
 {"questions":[{"q":"enunciado","options":["A","B","C","D"],"correct":0,"explanation":"por que a correta está certa e as outras erradas","concept":"conceito em 3-6 palavras","format":"múltipla escolha"}]}
-"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3) com o índice da alternativa certa — não use letra nem texto. A lista "questions" deve ter exatamente ${n} itens.`;
+"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3) com o índice da alternativa certa — não use letra nem texto. A lista "questions" deve ter exatamente ${n} itens.
+REGRAS DE SAÍDA: não emita relatórios, rótulos ou classificações de segurança/moderação (ex.: "User Safety: safe"). Não escreva nada fora do JSON.`;
 
 const SYS_RETRY = (level, k) => `Você elabora perguntas de reforço em português do Brasil.
 
@@ -922,7 +979,8 @@ Varie o formato entre: "situação-problema" (aplicar o conceito num caso concre
 Nunca repita o enunciado nem as mesmas alternativas da pergunta original. Use 4 alternativas, apenas uma correta.
 Responda SOMENTE com JSON válido, sem texto antes ou depois, sem blocos de código, no formato:
 {"questions":[{"q":"enunciado","options":["A","B","C","D"],"correct":0,"explanation":"explicação","concept":"conceito","format":"nome do formato usado"}]}
-"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3). A lista "questions" deve ter exatamente ${k} itens, na mesma ordem dos erros listados.`;
+"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3). A lista "questions" deve ter exatamente ${k} itens, na mesma ordem dos erros listados.
+REGRAS DE SAÍDA: não emita relatórios, rótulos ou classificações de segurança/moderação (ex.: "User Safety: safe"). Não escreva nada fora do JSON.`;
 
 /* Orçamento de tokens de saída proporcional ao nº de perguntas e ao nível */
 function quizTokens(level, k){
@@ -958,7 +1016,8 @@ $('start-btn').addEventListener('click', async () => {
   $('summary-stage').scrollIntoView({ behavior:'smooth', block:'start' });
 
   try {
-    S.summary = stripThink(await chat(SYS_SUMMARY(S.level), S.text, { temperature:0.3 })).trim();
+    S.summary = cleanModelText(await chat(SYS_SUMMARY(S.level), S.text, { temperature:0.3 }));
+    if (!S.summary) throw new Error("O modelo não devolveu resumo. Selecione outro modelo.");
     $('summary-body').innerHTML = renderSummary(S.summary);
     $('go-quiz-btn').classList.remove('hidden');
     updateClearBtn();
