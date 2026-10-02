@@ -148,6 +148,7 @@
   @keyframes spin{to{transform:rotate(360deg);}}
   .error-box a{color:#B91C1C; font-weight:700; text-decoration:underline;}
   .error-box{font-size:12.5px; color:#B91C1C; background:#FEE2E2; border-radius:12px; padding:10px 12px; margin-top:10px; line-height:1.45; white-space:pre-wrap;}
+  .warn-box{font-size:12px; color:#B45309; background:#FFF3B0; border-radius:12px; padding:8px 12px; margin:0 0 12px; line-height:1.45;}
   .hint{font-size:11px; color:#9C94B8; text-align:center; margin-top:8px;}
   /* ---------- Filtro / anexos ---------- */
   .btnrow{display:flex; gap:10px; align-items:stretch; margin-top:18px;}
@@ -285,10 +286,15 @@ const CONFIG = {
     "openai/gpt-4o-mini", "openai/gpt-4o", "anthropic/claude-3.5-haiku",
     "anthropic/claude-3.5-sonnet", "google/gemini-flash-1.5",
     "meta-llama/llama-3.1-70b-instruct", "deepseek/deepseek-chat"
-  ]
+  ],
+
+  // Teto de tokens de saída por chamada (o quiz escala até esse valor)
+  MAX_TOKENS_CAP: 16000,
+  // Fração mínima de perguntas válidas para aceitar a rodada parcial
+  MIN_VALID_RATIO: 0.5
 };
 
-const S = { apiKey:"", model:CONFIG.DEFAULT_MODEL, models:[], onlyFree:true, files:[], text:"", level:"", summary:"", rounds:[] };
+const S = { apiKey:"", model:CONFIG.DEFAULT_MODEL, models:[], onlyFree:true, files:[], text:"", level:"", summary:"", rounds:[], lastMode:"" };
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const COLORS = ["#22C55E","#0EA5E9","#8B5CF6","#EC4899","#F97316","#14B8A6","#F43F5E","#3B82F6"];
@@ -394,6 +400,9 @@ function jsonMode(modelId){
 
 const MODE_LABEL = { schema:"schema estrito", json:"modo JSON", prompt:"instrução no prompt" };
 
+/* Status HTTP em que vale tentar o próximo modo de saída (formato recusado ou falha do provedor) */
+const SOFT_STATUS = [400, 404, 422, 502, 503];
+
 async function rawCall(body){
   const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method:"POST",
@@ -402,25 +411,36 @@ async function rawCall(body){
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data.error) {
-    const e = new Error(data.error?.message || `HTTP ${r.status}`);
-    e.status = r.status;
+    const status = data.error?.code && Number.isInteger(data.error.code) ? data.error.code : r.status;
+    let msg = data.error?.message || `HTTP ${status}`;
+    if (status === 401) msg = "Chave da API inválida ou revogada (401). Confira a chave na configuração.";
+    if (status === 402) msg = "Sem créditos para este modelo (402). Escolha um modelo gratuito ou adicione créditos no OpenRouter.";
+    if (status === 429) msg = "Limite de requisições do modelo gratuito atingido (429). Aguarde 1 minuto ou troque de modelo.";
+    const e = new Error(msg);
+    e.status = status;
+    console.error("[OpenRouter]", status, data);
     throw e;
   }
   return data;
 }
 
-async function chat(system, user, { json=false, schema=null, temperature=0.4, model=null } = {}){
+/**
+ * Chamada ao modelo com cadeia de fallback schema → json → prompt.
+ * Com `validate`, uma saída inválida (JSON quebrado, formato errado) também
+ * desce para o próximo modo, em vez de repetir o mesmo modo que falhou.
+ */
+async function chat(system, user, { json=false, schema=null, temperature=0.4, model=null, maxTokens=4000, validate=null } = {}){
   if (!S.apiKey) throw new Error("Chave da API OpenRouter não informada.");
   const id = model || S.model;
-  const base = { model:id, temperature, max_tokens:4000,
+  if (!id) throw new Error("Nenhum modelo selecionado.");
+  const base = { model:id, temperature, max_tokens:maxTokens,
     messages:[{ role:"system", content:system }, { role:"user", content:user }] };
 
-  // ordem de tentativa: do mais garantido ao mais permissivo
   const chain = [];
   if (schema) {
     const mode = jsonMode(id);
     if (mode === "schema") chain.push({ mode:"schema", body:{ ...base, response_format:{ type:"json_schema", json_schema:schema } } });
-    if (mode !== "prompt") chain.push({ mode:"json",   body:{ ...base, response_format:{ type:"json_object" } } });
+    if (mode !== "prompt") chain.push({ mode:"json", body:{ ...base, response_format:{ type:"json_object" } } });
     chain.push({ mode:"prompt", body:base });
   } else if (json) {
     if (jsonMode(id) !== "prompt") chain.push({ mode:"json", body:{ ...base, response_format:{ type:"json_object" } } });
@@ -433,12 +453,33 @@ async function chat(system, user, { json=false, schema=null, temperature=0.4, mo
   for (const step of chain) {
     try {
       const data = await rawCall(step.body);
-      S.lastMode = step.mode;
-      return data.choices?.[0]?.message?.content ?? "";
+      const choice = data.choices?.[0] || {};
+      const c = choice.message?.content;
+      const text = Array.isArray(c) ? c.map(p => p.text || "").join("") : String(c ?? "");
+
+      if (!text.trim()) {
+        const e = new Error(choice.message?.reasoning
+          ? "O modelo gastou todos os tokens raciocinando e não devolveu resposta. Use um modelo sem 'thinking' ou reduza o nº de perguntas."
+          : "Resposta vazia do modelo.");
+        e.soft = true; throw e;
+      }
+
+      if (!validate) { S.lastMode = step.mode; return text; }
+
+      try {
+        const out = validate(text);
+        S.lastMode = step.mode;
+        return out;
+      } catch(ve){
+        console.warn(`[${step.mode}] saída inválida (${ve.message}):`, text.slice(0, 1500));
+        const e = new Error(choice.finish_reason === "length"
+          ? `Resposta cortada no limite de ${maxTokens} tokens. Reduza o nº de perguntas ou use outro modelo.`
+          : ve.message);
+        e.soft = true; throw e;
+      }
     } catch(e){
       lastErr = e;
-      // 400/404/422 = modelo recusou o formato → tenta o próximo nível
-      if (![400, 404, 422].includes(e.status)) throw e;
+      if (!e.soft && !SOFT_STATUS.includes(e.status)) throw e;   // 401, 402, 429 etc. → aborta
     }
   }
   throw lastErr;
@@ -466,7 +507,7 @@ function loadLib(name){
         pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
       res();
     };
-    s.onerror = () => rej(new Error(`Não consegui carregar a biblioteca de leitura (${name}). Verifique a conexão.`));
+    s.onerror = () => { delete loaded[name]; rej(new Error(`Não consegui carregar a biblioteca de leitura (${name}). Verifique a conexão.`)); };
     document.head.appendChild(s);
   });
   return loaded[name];
@@ -512,7 +553,7 @@ async function ocrDataUrl(dataUrl, visionModel){
     { type:"text", text:"Transcreva todo o texto desta imagem." },
     { type:"image_url", image_url:{ url: dataUrl } }
   ], { temperature:0.1, model: visionModel });
-  const clean = String(txt).trim();
+  const clean = stripThink(txt).trim();
   return (!clean || clean === "[sem texto legível]") ? "" : clean;
 }
 
@@ -664,7 +705,7 @@ $('ocr-btn').addEventListener('click', async () => {
   $('ocr-status').textContent = "";
 
   const parts = [];
-  const pending = S.files.filter(f => f.state !== "done");
+  const pending = S.files.filter(f => f.state !== "done" && f.state !== "err");
 
   for (let i = 0; i < pending.length; i++) {
     const it = pending[i];
@@ -679,7 +720,6 @@ $('ocr-btn').addEventListener('click', async () => {
       else if (it.kind === "xlsx")  r = await extractXlsx(it.file);
       else if (it.kind === "image") r = await extractImage(it);
       else                          r = await extractText(it.file);
-      it.state = "done";
       const chars = r.text.length.toLocaleString('pt-BR');
       setStat(`✓ ${chars} caracteres${r.note ? " · " + r.note : ""}`, "ok");
       it.state = "done";
@@ -744,22 +784,63 @@ function quizSchema(level, n){
   };
 }
 
+/* ---------- parse e normalização tolerantes ---------- */
+// Remove blocos de raciocínio que alguns modelos gratuitos embutem no conteúdo
+const stripThink = s => String(s ?? "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/^[\s\S]*?<\/think>/i, "");
+
 function parseJson(raw){
-  let t = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  let t = stripThink(raw).trim()
+    .replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  const a = t.search(/[\[{]/);
+  const b = Math.max(t.lastIndexOf("}"), t.lastIndexOf("]"));
   if (a >= 0 && b > a) t = t.slice(a, b + 1);
-  return JSON.parse(t);
+  try { return JSON.parse(t); }
+  catch(_){
+    // vírgulas sobrando antes de } ou ] são o erro mais comum de modelos menores
+    return JSON.parse(t.replace(/,\s*([}\]])/g, "$1"));
+  }
 }
 
-function validateQuestions(list, n){
-  if (!Array.isArray(list)) throw new Error("Resposta sem lista de perguntas.");
-  const ok = list.filter(q => q && typeof q.q === "string" && Array.isArray(q.options) && q.options.length >= 2
-    && Number.isInteger(q.correct) && q.correct >= 0 && q.correct < q.options.length);
-  if (ok.length < n) throw new Error(`Modelo retornou ${ok.length} perguntas válidas, esperado ${n}.`);
-  return ok.slice(0, n).map(q => ({
-    q:q.q, options:q.options.map(String), correct:q.correct,
-    explanation:q.explanation || "", concept:q.concept || "", format:q.format || "múltipla escolha"
-  }));
+function extractQuestions(obj){
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.questions)) return obj.questions;
+  for (const v of Object.values(obj || {})) {
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object" && Array.isArray(v.questions)) return v.questions;
+  }
+  return null;
+}
+
+function normCorrect(c, opts){
+  if (typeof c === "number") return Number.isInteger(c) ? c : -1;
+  const s = String(c ?? "").trim();
+  if (/^\d+$/.test(s)) return +s;
+  if (/^[A-Da-d]$/.test(s)) return s.toUpperCase().charCodeAt(0) - 65;
+  return opts.findIndex(o => o.trim().toLowerCase() === s.toLowerCase());
+}
+
+function validateQuestions(parsed, n){
+  const list = extractQuestions(parsed);
+  if (!list) throw new Error("Resposta sem lista de perguntas.");
+  const ok = list.map(q => {
+    if (!q || typeof q !== "object") return null;
+    const rawOpts = q.options || q.alternativas || q.choices || [];
+    if (!Array.isArray(rawOpts)) return null;
+    const options = rawOpts.map(o => typeof o === "object" && o !== null ? String(o.text ?? o.label ?? o.value ?? "") : String(o)).filter(o => o.trim());
+    const correct = normCorrect(q.correct ?? q.answer ?? q.resposta, options);
+    const text = q.q || q.question || q.pergunta || q.enunciado;
+    if (typeof text !== "string" || !text.trim() || options.length < 2 || correct < 0 || correct >= options.length) return null;
+    return {
+      q: text, options, correct,
+      explanation: String(q.explanation || q.explicacao || ""),
+      concept: String(q.concept || q.conceito || ""),
+      format: String(q.format || q.formato || "múltipla escolha")
+    };
+  }).filter(Boolean);
+
+  const min = Math.max(1, Math.ceil(n * CONFIG.MIN_VALID_RATIO));
+  if (ok.length < min) throw new Error(`Modelo retornou ${ok.length} perguntas válidas, mínimo ${min} de ${n}.`);
+  return ok.slice(0, n);
 }
 
 /* ===================== PROMPTS ===================== */
@@ -828,9 +909,9 @@ ${nivelBloco(level)}
 
 TAREFA: gere EXATAMENTE ${n} perguntas sobre o conteúdo enviado, com 4 alternativas cada e apenas uma correta.
 Distribua dificuldade progressiva (fácil → difícil) DENTRO do nível cognitivo definido acima — não suba nem desça de faixa.
-Responda SOMENTE com JSON válido, sem texto antes ou depois, no formato:
+Responda SOMENTE com JSON válido, sem texto antes ou depois, sem blocos de código, no formato:
 {"questions":[{"q":"enunciado","options":["A","B","C","D"],"correct":0,"explanation":"por que a correta está certa e as outras erradas","concept":"conceito em 3-6 palavras","format":"múltipla escolha"}]}
-"correct" é o índice (0-3) da alternativa certa. A lista "questions" deve ter exatamente ${n} itens.`;
+"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3) com o índice da alternativa certa — não use letra nem texto. A lista "questions" deve ter exatamente ${n} itens.`;
 
 const SYS_RETRY = (level, k) => `Você elabora perguntas de reforço em português do Brasil.
 
@@ -839,13 +920,19 @@ ${nivelBloco(level)}
 O aluno errou ${k} pergunta(s). Para CADA erro listado, gere UMA nova pergunta sobre o MESMO conceito, mas com abordagem diferente da original.
 Varie o formato entre: "situação-problema" (aplicar o conceito num caso concreto), "complete a lacuna", "qual afirmação é falsa", "verdadeiro ou falso" (opções: Verdadeiro/Falso + 2 distratores explicativos), "compare e contraste", "causa e consequência".
 Nunca repita o enunciado nem as mesmas alternativas da pergunta original. Use 4 alternativas, apenas uma correta.
-Responda SOMENTE com JSON válido, sem texto antes ou depois, no formato:
+Responda SOMENTE com JSON válido, sem texto antes ou depois, sem blocos de código, no formato:
 {"questions":[{"q":"enunciado","options":["A","B","C","D"],"correct":0,"explanation":"explicação","concept":"conceito","format":"nome do formato usado"}]}
-A lista "questions" deve ter exatamente ${k} itens, na mesma ordem dos erros listados.`;
+"correct" é um NÚMERO INTEIRO (0, 1, 2 ou 3). A lista "questions" deve ter exatamente ${k} itens, na mesma ordem dos erros listados.`;
+
+/* Orçamento de tokens de saída proporcional ao nº de perguntas e ao nível */
+function quizTokens(level, k){
+  const perQ = (level === "sup" || level === "em") ? 700 : 450;
+  return Math.min(CONFIG.MAX_TOKENS_CAP, 1200 + k * perQ);
+}
 
 /* ===================== FLUXO ===================== */
 function showErr(id, msg){ const e=$(id); e.textContent = msg; e.classList.remove('hidden'); }
-function hideErr(id){ $(id).classList.add('hidden'); }
+function hideErr(id){ const e=$(id); e.classList.add('hidden'); e.textContent = ""; }
 
 $('start-btn').addEventListener('click', async () => {
   hideErr('input-error');
@@ -871,7 +958,7 @@ $('start-btn').addEventListener('click', async () => {
   $('summary-stage').scrollIntoView({ behavior:'smooth', block:'start' });
 
   try {
-    S.summary = await chat(SYS_SUMMARY(S.level), S.text, { temperature:0.3 });
+    S.summary = stripThink(await chat(SYS_SUMMARY(S.level), S.text, { temperature:0.3 })).trim();
     $('summary-body').innerHTML = renderSummary(S.summary);
     $('go-quiz-btn').classList.remove('hidden');
     updateClearBtn();
@@ -912,35 +999,45 @@ async function generateRound({ first=false, missed=[] } = {}){
     : `CONTEÚDO:\n${S.text}\n\nERROS DO ALUNO:\n` + missed.map((m, i) =>
         `${i+1}. Conceito: ${m.concept}\n   Pergunta original: ${m.q}\n   Aluno respondeu: ${m.chosen ?? "(em branco)"}\n   Correta: ${m.options[m.correct]}\n   Explicação: ${m.explanation}`).join("\n");
 
+  const maxTokens = quizTokens(S.level, k);
   let questions = null, lastErr = null;
   for (let attempt = 0; attempt < 2 && !questions; attempt++) {
     try {
-      const raw = await chat(first ? SYS_QUIZ(S.level, k) : SYS_RETRY(S.level, k), userMsg,
-        { schema: quizSchema(S.level, k), temperature: attempt ? 0.7 : 0.5 });
-      questions = validateQuestions(parseJson(raw).questions, k);
-    } catch(e){ lastErr = e; }
+      questions = await chat(first ? SYS_QUIZ(S.level, k) : SYS_RETRY(S.level, k), userMsg, {
+        schema: quizSchema(S.level, k),
+        temperature: attempt ? 0.7 : 0.5,
+        maxTokens,
+        validate: raw => validateQuestions(parseJson(raw), k)
+      });
+    } catch(e){
+      lastErr = e;
+      // erros terminais: não adianta tentar de novo
+      if (!e.soft && [401, 402, 429].includes(e.status)) break;
+    }
   }
   $('quiz-loader').classList.add('hidden');
   if (!questions) {
-    showErr('quiz-error', "Não consegui gerar as perguntas: " + lastErr.message + "\nTente novamente ou troque o modelo.");
-    const b = document.createElement('button'); b.className = "btn sm ghost"; b.textContent = "Tentar de novo"; b.style.marginTop = "10px";
+    showErr('quiz-error', "Não consegui gerar as perguntas: " + (lastErr?.message || "erro desconhecido") + "\nTente novamente ou troque o modelo. Detalhes no console (F12).");
+    const b = document.createElement('button'); b.className = "btn sm ghost"; b.type = "button"; b.textContent = "Tentar de novo"; b.style.marginTop = "10px";
     b.onclick = () => { b.remove(); generateRound({ first, missed }); };
     $('quiz-error').appendChild(b);
     return;
   }
-  S.rounds.push({ questions, corrected:false, mode: MODE_LABEL[S.lastMode] || "" });
+  S.rounds.push({ questions, requested:k, corrected:false, mode: MODE_LABEL[S.lastMode] || "" });
   renderRound(S.rounds.length - 1);
 }
 
 function renderRound(ri){
   const round = S.rounds[ri];
+  const partial = round.questions.length < round.requested;
   const wrap = document.createElement('div'); wrap.id = `round-${ri}`;
   wrap.innerHTML = `
     <div class="round-title">
       <h2>${ri === 0 ? "🎯 Quiz" : `🔁 Rodada ${ri+1} · reforço`}</h2>
       <span class="pill">${round.questions.length} pergunta(s)${round.mode ? " · " + round.mode : ""}</span>
     </div>
-    <form id="form-${ri}"></form>
+    ${partial ? `<div class="warn-box">O modelo devolveu ${round.questions.length} de ${round.requested} perguntas válidas. Para o número completo, reduza a quantidade ou troque de modelo.</div>` : ""}
+    <form id="form-${ri}" onsubmit="return false;"></form>
     <button class="btn purple" id="check-${ri}" type="button">✅ Corrigir minhas respostas</button>
     <div id="result-${ri}"></div>`;
   $('rounds').appendChild(wrap);
@@ -992,7 +1089,7 @@ async function correctRound(ri){
     const opts = form.querySelectorAll(`.opt[data-qi="${qi}"]`);
     opts.forEach(l => { l.classList.add('locked'); l.querySelector('input').disabled = true; });
     const chosen = sel ? parseInt(sel.value, 10) : null;
-    const why = `<span class="why"><b>Por quê:</b> ${esc(item.explanation)}</span>`;
+    const why = item.explanation ? `<span class="why"><b>Por quê:</b> ${esc(item.explanation)}</span>` : "";
     if (chosen === item.correct) {
       score++; opts[chosen].classList.add('correct');
       fb.innerHTML = `🎉 Isso mesmo!${why}`; fb.className = 'fb show right';
